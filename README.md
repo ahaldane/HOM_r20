@@ -42,7 +42,7 @@ This runs the "count" action, against the database "my_example", and will write 
 Typical Usage and Tips
 ======================
 
-To produce the plots like in the biophys J paper, do:
+To produce the plots like in certain publications:
 ```python
 >>> r20 = np.load('r20_mi.npy')
 >>> r20 = np.nanmean(r20, axis=1)
@@ -54,4 +54,4 @@ The example code ran very fast because the example MSAs are so small. In practic
 
 The r20 you calculate from some MSAs can be low either because the "modelMSA" is mismatched to the "targetMSA", which we call "specification error", or because you used too few sequences in the r20 calculation, which we call "validation error". Validation error is uninteresting, you want to eliminate it. To test how much validation error you have, try getting another MSA drawn from the same distribution as the targetMSA, of the same size as your target/model MSAs, so that you expect the r20 to be 1. Then measure the r20. If it is not 1, it means you have validation error. We can also work out with simple assumptions, that if in this validation error test your MSAs had N0 sequenes and you gor an r20 value of r0, you can extrapolate using the formula r^2 = (N/N0) r0^2 / ((N/N0-1) r0^2 + 1) to get the expected r20 score "r" you would get if you increased the MSA size to N sequences.
 
-Also, note that I consider the r20 score calculation a "first draft" of a useful statistic, and it has drawbacks because of the large # of sequence it requires, because it measures a correlation rather than an absolute error, and because the value "20" is partly ad-hoc to account for finite MSA sizes. I am a bit reluctant to have too many of us begin to rely on it heavily exatly as it is, it would be nicer to find a better variation on it.
+This script supports variations on the r20 score through the "--topmode" and "--score" options. "--topmode" can be either an integer (default 20) specifying the number of largest subsequence marginals to track, a string like ">0.01" which says to track all subsequences above 1% frequency, or 'nonzero' to track all observed subsequences. "--score" can be "pearson", "spearman", or "pcttvd" which specifies which summary statistic to use to compare the database and MSA marginals statistics.

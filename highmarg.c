@@ -147,21 +147,19 @@ highmarg(PyObject *self, PyObject *args, PyObject *kwargs)
     }
 
     // allocate a histogram for each input MSA, combined in one memory block.
-    float *histdat = malloc(sizeof(*histdat)*tot_nseq*n_msas);
+    float *histdat = PyMem_RawMalloc(sizeof(*histdat)*tot_nseq*n_msas);
     if (histdat == NULL) {
-        PyErr_SetString(PyExc_MemoryError, "failed malloc");
-        return NULL;
+        return PyErr_NoMemory();
     }
     memset(histdat, 0, sizeof(*histdat)*tot_nseq*n_msas);
     
     // allocate space to store unique sequences
     uint8 *uniqueseq = NULL;
     if (return_uniq) {
-        uniqueseq = malloc(sizeof(uint8)*tot_nseq*L);
+        uniqueseq = PyMem_RawMalloc(sizeof(uint8)*tot_nseq*L);
         if (uniqueseq == NULL) {
-            PyErr_SetString(PyExc_MemoryError, "failed malloc");
-            free(histdat);
-            return NULL;
+            PyMem_RawFree(histdat);
+            return PyErr_NoMemory();
         }
     }
     
@@ -169,9 +167,9 @@ highmarg(PyObject *self, PyObject *args, PyObject *kwargs)
     art_tree t;
     if (art_tree_init(&t) != 0) {
         PyErr_SetString(PyExc_RuntimeError, "libart failed");
-        free(histdat);
+        PyMem_RawFree(histdat);
         if (return_uniq) {
-            free(uniqueseq);
+            PyMem_RawFree(uniqueseq);
         }
         return NULL;
     }
@@ -214,15 +212,15 @@ highmarg(PyObject *self, PyObject *args, PyObject *kwargs)
     npy_intp ret_hist_dim[2] = {n_seen, n_msas};
     PyObject *ret_hists = PyArray_SimpleNew(2, ret_hist_dim, NPY_FLOAT);
     if (ret_hists == NULL) {
-        free(histdat);
+        PyMem_RawFree(histdat);
         if (return_uniq) {
-            free(uniqueseq);
+            PyMem_RawFree(uniqueseq);
         }
         return NULL;
     }
     memcpy(PyArray_DATA((PyArrayObject*)ret_hists), histdat,
            PyArray_NBYTES((PyArrayObject*)ret_hists));
-    free(histdat);
+    PyMem_RawFree(histdat);
     
     // return if user did not request uniq sequences
     if (!return_uniq) {
@@ -233,12 +231,12 @@ highmarg(PyObject *self, PyObject *args, PyObject *kwargs)
     npy_intp ret_uniq_dim[2] = {n_seen, L};
     PyObject *ret_uniq = PyArray_SimpleNew(2, ret_uniq_dim, NPY_UINT8);
     if (ret_uniq == NULL) {
-        free(uniqueseq);
+        PyMem_RawFree(uniqueseq);
         return NULL;
     }
     memcpy(PyArray_DATA((PyArrayObject*)ret_uniq), uniqueseq,
            PyArray_NBYTES((PyArrayObject*)ret_uniq));
-    free(uniqueseq);
+    PyMem_RawFree(uniqueseq);
 
     return PyTuple_Pack(2, ret_hists, ret_uniq);
 }
