@@ -83,7 +83,7 @@ def make_db(args):
     args = parser.parse_args(args)
 
     reps = args.reps
-    name = args.name
+    name = args.name.strip('.db')
     topmode = args.topmode
 
     dataseqs = seqload.loadSeqs(args.msa)[0]
@@ -167,7 +167,7 @@ def count_msas(args):
         weights = [np.load(w) if w != 'None' else None for m in args.weights]
 
     positionsets = {}
-    with open('{}.db'.format(args.db_name), "rt") as f:
+    with open('{}.db'.format(args.db_name.rstrip('.db')), "rt") as f:
         while True:
             lines = []
             while lines == [] or lines[-1] not in ['\n', '']:
