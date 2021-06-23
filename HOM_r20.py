@@ -1,15 +1,20 @@
 #!/usr/bin/env python
 import sys, os, argparse, warnings, signal
-from multiprocessing import Pool, set_start_method, shared_memory
-from concurrent.futures import ProcessPoolExecutor
+# use ProcessPoolExecutor instead of Pool because of better error handling
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import shared_memory
 import numpy as np
 from numpy import random
 import seqload
 from scipy.stats import pearsonr, spearmanr
 from highmarg import highmarg, countref
 
+# class to store MSA+weights in shared memory, to share between processes
+# (since MSA is huge)
 class SharedMSA:
     def __init__(self, msa, weights, shape=None):
+        # user either provides MSAs to create shared mem for,
+        # or provides the shared-mem lookup info, and we load it.
         if shape is None:
             self.create_shm(msa, weights)
         else:
@@ -59,6 +64,28 @@ class SharedMSA:
         self.unlink()
         sys.exit(1)
 
+# like executor.map, but prints out progress to stdout
+def map_progress(executor, func, jobs):
+    fs = [executor.submit(func, *j) for j in jobs]
+    N = len(fs)
+
+    # Yield must be hidden in closure so that the futures are submitted
+    # before the first iterator value is required.
+    def result_iterator():
+        try:
+            # reverse to keep finishing order
+            fs.reverse()
+            while fs:
+                # Careful not to keep a reference to the popped future
+                print(f"\rjobs remaining:  {len(fs): 10d}/{N}       ", end="")
+                yield fs.pop().result()
+        finally:
+            for future in fs:
+                future.cancel()
+        print("")
+    return result_iterator()
+
+
 alpha = "-ACDEFGHIKLMNPQRSTVWY"
 
 def get_subseq(msa, pos, out=None):
@@ -86,7 +113,9 @@ def process_marg(topmode, npos, i, pos, f, uniq):
     if topmode.startswith('>'):
         top = f > float(topmode[1:])
     else:
-        top = np.argsort(f)[-int(topmode):]
+        ntop = int(topmode)
+        top = np.argpartition(f, -ntop)[-ntop:]
+        top = top[np.argsort(f[top])]
 
     seqs = ["".join(alpha[c] for c in si) for si in uniq[top]]
     f = f[top]
@@ -97,60 +126,28 @@ def process_marg(topmode, npos, i, pos, f, uniq):
 
     return out
 
-# use a global var here for msa, weights so they do not need to be
-# serialized by the processing pool - we can just access them in job.
-# This way, when "fork"ing on unix systems, we can save memory/cache
-# by page re-use from copy-on-write.
-def makedb_job(arg):
+def makedb_job(npos, i, seed, topmode, shm_info):
     """
     choose a random set-of-positions, compute high-marg for those positions
     in all datasets, and call user-defined processing function with the marg
     """
-    try:
-        npos, i, seed, topmode, shm_info = arg
-        rng = np.random.default_rng(seed)
-        
-        shm = SharedMSA(*shm_info)
+    #npos, i, seed, topmode, shm_info = arg
+    rng = np.random.default_rng(seed)
+    
+    shm = SharedMSA(*shm_info)
 
-        L = shm.msa.shape[1]
-        pos = np.sort(rng.choice(L, npos, replace=False))
+    L = shm.msa.shape[1]
+    pos = np.sort(rng.choice(L, npos, replace=False))
 
-        subseqs = np.ascontiguousarray(get_subseq(shm.msa, pos))
+    subseqs = np.ascontiguousarray(get_subseq(shm.msa, pos))
 
-        #print("START", npos, i, repr(pos))
-        counts, uniq = highmarg([subseqs], weights=shm.weights, return_uniq=True)
-        #print("DONE", npos, i)
-        freq = counts[:,0]/np.sum(counts)
-        #assert(N == (np.sum(weights) if weights is not None else msa.shape[0]))
+    counts, uniq = highmarg([subseqs], weights=shm.weights, return_uniq=True)
+    freq = counts[:,0]/np.sum(counts)
+    #assert(N == (np.sum(weights) if weights is not None else msa.shape[0]))
 
-        shm.close()
-        return npos, i, process_marg(topmode, npos, i, pos, freq, uniq)
-    except Exception as e:
-        print("ERROR", e)
+    shm.close()
 
-def run_make_db(root_seed, topmode, npos_range, shm, reps, name):
-    jobs = list( (n, i, root_seed.spawn(1)[0], topmode, shm.info())
-                for n in npos_range[::-1] for i in range(reps))
-
-    res = []
-    remaining = set((n,i) for n,i,_,_,_ in jobs)
-
-    print(f"Starting {os.cpu_count()} workers...")
-    print(len(jobs))
-    set_start_method('spawn')
-    with ProcessPoolExecutor(os.cpu_count()) as pool:
-        #for n, i, dat in pool.imap_unordered(makedb_job, jobs):
-        for n, i, dat in pool.map(makedb_job, jobs, chunksize=64):
-            res.append(dat)
-            remaining.difference_update([(n,i)])
-            #print(f"\r{n: 3d} {i: 6d}  {len(remaining): 8d}       ", end="")
-            print(f"{n: 3d} {i: 6d}  {len(remaining): 8d}   {max(remaining)}  {min(remaining)}       ")
-            #if len(remaining) < 50:
-            #    #print("")
-            #    print(remaining, max(remaining), min(remaining))
-
-    with open("{}.db".format(name), "wt") as f:
-        f.write("".join(res))
+    return npos, i, process_marg(topmode, npos, i, pos, freq, uniq)
 
 def make_db(args):
     parser = argparse.ArgumentParser()
@@ -181,12 +178,23 @@ def make_db(args):
     root_seed = np.random.SeedSequence()
 
     shm = SharedMSA(dataseqs, weights)
-
     try:
-        run_make_db(root_seed, topmode, npos_range, shm, reps, name)
+        jobs = list( (n, i, root_seed.spawn(1)[0], topmode, shm.info())
+                    for n in npos_range[::-1] for i in range(reps))
+        print(f"Starting {os.cpu_count()} workers...")
+        res = []
+        with ProcessPoolExecutor(os.cpu_count()) as executor:
+            futures = [executor.submit(makedb_job, *j) for j in jobs]
+            for future in as_completed(futures):
+                n, i, dat = future.result()
+                res.append(dat)
+                print(f"\r{n: 3d} {i: 6d}    ", end="")
     finally:
         shm.close()
         shm.unlink()
+
+    with open("{}.db".format(name), "wt") as f:
+        f.write("".join(res))
 
     print("Done!")
 
@@ -197,13 +205,15 @@ from more_itertools import set_partitions
 
 def connected_corr(subseqs, s):
     N, L = subseqs.shape
+
+    # for each column, keep track of matches (bool seq-ident)
     ids = subseqs == s  # should be fortran ordered
 
     # first construct dict of higher-order marginals to all orders for these
     # positions using stack-based algo to minimize computational operations
-    pos = [0]
-    idstack = [True, ids[:,0]]
-    f = {}
+    pos = [0]  # current set-of-positions
+    idstack = [True, ids[:,0]] # stack of total seq match bools
+    f = {}  # dict of computed marginals
     while True:
         f[tuple(pos)] = np.mean(idstack[-1])
         
@@ -217,34 +227,6 @@ def connected_corr(subseqs, s):
         else:
             pos.append(pos[-1]+1)
             idstack.append(ids[:,pos[-1]] & idstack[-1])
-
-    # DEBUG CODE/sanity check
-    #pos = [0]
-    #idstack = np.empty((L, N), dtype=bool)
-    #idstack[0] = ids[:,0]
-    #top = 0
-    #f = {}
-    #while True:
-    #    #f[tuple(pos)] = np.mean(idstack[top])
-    #    f[tuple(pos)] = np.sum(idstack[top])/float(N)
-        
-    #    if pos[-1] == L-1:
-    #        pos.pop()
-    #        if pos == []:
-    #            break
-    #        pos[-1] += 1
-    #        if len(pos) == 1:
-    #            idstack[0] = ids[:,pos[-1]]
-    #        else:
-    #            np.logical_and(ids[:,pos[-1]], idstack[top-2], out=idstack[top-1])
-    #        top -= 1
-    #    else:
-    #        pos.append(pos[-1]+1)
-    #        np.logical_and(ids[:,pos[-1]], idstack[top], out=idstack[top+1])
-    #        top += 1
-    # sanity check:
-    #print(forig, f[tuple(range(L))])
-
 
     # now use the formula:
     # g_1..n = f_1..n - \sum_P \prod_Pi g_Pi
@@ -267,8 +249,8 @@ def connected_corr(subseqs, s):
 
     return gs[pos]
 
-def convert_cc_job(arg):
-    (pos, seqs), shm_info = arg
+def convert_cc_job(dat, shm_info):
+    pos, seqs = dat
     shm = SharedMSA(*shm_info)
 
     subseqs = get_subseq(shm.msa, pos)
@@ -276,23 +258,6 @@ def convert_cc_job(arg):
 
     shm.close()
     return gs
-
-def run_convert_cc_db(npos, positionsets, out_db_name, shm_info):
-
-    jobs = [(d, shm_info) for n in npos for d in positionsets[n]]
-
-    print(f"Starting {os.cpu_count()} workers...")
-    set_start_method('spawn')
-    with Pool(os.cpu_count()) as pool:
-        res = pool.map(convert_cc_job, jobs)
-
-    with open("{}.db".format(out_db_name), "wt") as f:
-        for (pos, seqs), gs in zip(jobs, res):
-            out = [" ".join(str(p) for p in pos)]
-            seqs = ["".join(alpha[c] for c in si) for si in seqs]
-            out += ["{} {}".format(si, fi) for si,fi in zip(seqs, gs)]
-            out = "\n".join(out) + '\n\n'
-            f.write(out)
 
 def convert_cc_db(args):
     parser = argparse.ArgumentParser()
@@ -334,24 +299,34 @@ def convert_cc_db(args):
     npos.sort(reverse=True)
 
     shm = SharedMSA(msa, None)
-
     try:
-        run_convert_cc_db(npos, positionsets, out_db_name, shm.info())
+        jobs = [(d, shm.info()) for n in npos for d in positionsets[n]]
+        print(f"Starting {os.cpu_count()} workers...")
+        with ProcessPoolExecutor(os.cpu_count()) as executor:
+            res = list(map_progress(executor, convert_cc_job, jobs))
     finally:
         shm.close()
         shm.unlink()
 
+    with open("{}.db".format(out_db_name), "wt") as f:
+        for ((pos, seqs), _), gs in zip(jobs, res):
+            out = [" ".join(str(p) for p in pos)]
+            seqs = ["".join(alpha[c] for c in si) for si in seqs]
+            out += ["{} {}".format(si, fi) for si,fi in zip(seqs, gs)]
+            out = "\n".join(out) + '\n\n'
+            f.write(out)
+
 ###############################################################################
 # Functions to search db and compute r20
 
-def count_job(arg):
-    (pos, ref_seqs, fs), score, shm_info = arg
+def count_job(dat, score, shm_info):
+    pos, ref_seqs, fs = dat
 
     shm = SharedMSA(*shm_info)
     msa, weights = shm.msa, shm.weights
 
     subseqs = np.ascontiguousarray(get_subseq(msa, pos))
-    dfs = countref(ref_seqs, [subseqs], weights)
+    dfs = countref(ref_seqs, [subseqs], weights)[:,0]
 
     if weights is not None:
         Ns = msa.shape[0] if weights is None else np.sum(weights)
@@ -365,27 +340,16 @@ def count_job(arg):
         warnings.simplefilter('ignore')
 
         if score == 'pearson':
-            return pearsonr(fs, r)[0]
+            return pearsonr(dfs, fs)[0]
         elif score == 'pearsonlog':
-            return pearsonr(np.log(fs), np.log(r))[0]
+            return pearsonr(np.log(dfs), np.log(fs))[0]
         elif score == 'spearman':
-            return spearmanr(fs, r)[0]
+            return spearmanr(dfs, fs)[0]
         elif score == 'pcttvd':
-            s = 2*np.sum(fs)
-            return np.sum(np.abs(r - fs))/s
+            s = 2*np.sum(dfs)
+            return np.sum(np.abs(dfs - fs))/s
         else:
             raise ValueError("invalid scoring method")
-
-def run_count_msas(npos, positionsets, out_name, score, shm_info):
-    jobs = ((d, score, shm_info) for n in npos for d in positionsets[n])
-
-    print(f"Starting {os.cpu_count()} workers...")
-    set_start_method('spawn')
-    with Pool(os.cpu_count()) as pool:
-        res = pool.map(count_job, jobs)
-
-    res = np.array(res).reshape((len(npos), -1))
-    np.save(out_name, res)
 
 def count_msas(args):
     parser = argparse.ArgumentParser()
@@ -397,7 +361,7 @@ def count_msas(args):
                         choices=['pearson', 'pearsonlog', 'spearman', 'pcttvd'])
     args = parser.parse_args(args)
 
-    msa = seqload.loadSeqs(m)[0]
+    msa = seqload.loadSeqs(args.msa)[0]
     weights = None
     if args.weights:
         weights = [np.load(w) if w != 'None' else None for m in args.weights]
@@ -423,23 +387,26 @@ def count_msas(args):
                 positionsets[npos] = []
             positionsets[npos].append((pos, seqs, fs))
     npos = list(positionsets.keys())
-    npos.sort()
+    npos.sort(reverse=True) # process from largest to smallest
 
     shm = SharedMSA(msa, weights)
-
     try:
-        run_count_msas(npos, positionsets, args.out_name,
-                       args.score, shm.info())
+        jobs = ((d, args.score, shm.info()) for n in npos for d in positionsets[n])
+        print(f"Starting {os.cpu_count()} workers...")
+        with ProcessPoolExecutor(os.cpu_count()) as executor:
+            res = list(map_progress(executor, count_job, jobs))
     finally:
         shm.close()
         shm.unlink()
 
+    res = np.array(res).reshape((len(npos), -1))[::-1,:] # smallest first
+    np.save(args.out_name, res)
+
 ###############################################################################
 # Functions to search db and compute r20
 
-def count_cc_job(arg):
-    (pos, seqs, ogs), score, shm_info = arg
-    print(pos)
+def count_cc_job(dat, score, shm_info):
+    pos, seqs, ogs = dat
 
     shm = SharedMSA(*shm_info)
     msa, weights = shm.msa, shm.weights
@@ -458,16 +425,6 @@ def count_cc_job(arg):
             return spearmanr(ogs, gs)[0]
         else:
             raise ValueError("invalid scoring method")
-
-def run_count_cc_msas(npos, positionsets, out_name, score, shm_info):
-    jobs = ((d, score, shm_info) for n in npos for d in positionsets[n])
-
-    print(f"Starting {os.cpu_count()} workers...")
-    set_start_method('spawn')
-    with Pool(os.cpu_count()) as pool:
-        res = pool.map(count_cc_job, jobs)
-    res = np.array(res).reshape((len(npos), -1))
-    np.save(out_name, res)
 
 def count_cc_msas(args):
     parser = argparse.ArgumentParser()
@@ -501,19 +458,23 @@ def count_cc_msas(args):
                 positionsets[npos] = []
             positionsets[npos].append((pos, seqs, gs))
     npos = list(positionsets.keys())
-    npos.sort()
+    npos.sort(reverse=True) # process from largest to smallest
 
     shm = SharedMSA(msa, None)
-
     try:
-        run_count_cc_msas(npos, positionsets, args.out_name,
-                          args.score, shm.info())
+        jobs = ((d, args.score, shm.info()) for n in npos for d in positionsets[n])
+        print(f"Starting {os.cpu_count()} workers...")
+        with ProcessPoolExecutor(os.cpu_count()) as executor:
+            res = list(map_progress(executor, count_cc_job, jobs))
     finally:
         shm.close()
         shm.unlink()
 
+    res = np.array(res).reshape((len(npos), -1))[::-1,:] # smallest first
+    np.save(args.out_name, res)
+
 ###############################################################################
-# this is used to development only to time performance
+# this is used for development only to time performance
 
 #def profile_count(args):
 #    parser = argparse.ArgumentParser()

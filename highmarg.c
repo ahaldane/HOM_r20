@@ -173,6 +173,7 @@ highmarg(PyObject *self, PyObject *args, PyObject *kwargs)
         }
         return NULL;
     }
+
     
     // iterate all sequences, put into the trie, build histograms
     int n_seen = 0;
@@ -189,6 +190,8 @@ highmarg(PyObject *self, PyObject *args, PyObject *kwargs)
             }
         }
 
+        Py_BEGIN_ALLOW_THREADS;
+
         for (int i = 0; i < nseq; i++) {
             float *new_val = &histdat[n_seen*n_msas];
             float *old_val = art_search_or_insert(&t, &msa_dat[i*L],
@@ -204,9 +207,12 @@ highmarg(PyObject *self, PyObject *args, PyObject *kwargs)
                 old_val[msa_i] += (wgt_dat == NULL) ? 1 : wgt_dat[i];
             }
         }
+
+        Py_END_ALLOW_THREADS;
     }
     
     art_tree_destroy(&t);
+
 
     // allocate output ndarray for hist based on size of trie and copy data in
     npy_intp ret_hist_dim[2] = {n_seen, n_msas};
@@ -231,6 +237,7 @@ highmarg(PyObject *self, PyObject *args, PyObject *kwargs)
     npy_intp ret_uniq_dim[2] = {n_seen, L};
     PyObject *ret_uniq = PyArray_SimpleNew(2, ret_uniq_dim, NPY_UINT8);
     if (ret_uniq == NULL) {
+        Py_DECREF(ret_hists);
         PyMem_RawFree(uniqueseq);
         return NULL;
     }
@@ -238,7 +245,10 @@ highmarg(PyObject *self, PyObject *args, PyObject *kwargs)
            PyArray_NBYTES((PyArrayObject*)ret_uniq));
     PyMem_RawFree(uniqueseq);
 
-    return PyTuple_Pack(2, ret_hists, ret_uniq);
+    PyObject *ret = PyTuple_Pack(2, ret_hists, ret_uniq);
+    Py_DECREF(ret_uniq);
+    Py_DECREF(ret_hists);
+    return ret;
 }
 
 static PyObject *
@@ -345,6 +355,8 @@ countref(PyObject *self, PyObject *args, PyObject *kwargs)
             }
         }
 
+        Py_BEGIN_ALLOW_THREADS;
+
         #define innerloop(val) \
             for (int i = 0; i < nseq; i++) { \
                 float *h = art_search(&t, &msa_dat[i*L], L); \
@@ -361,6 +373,8 @@ countref(PyObject *self, PyObject *args, PyObject *kwargs)
         }
 
         #undef innerloop
+
+        Py_END_ALLOW_THREADS;
     }
     
     art_tree_destroy(&t);
