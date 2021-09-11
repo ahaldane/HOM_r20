@@ -3,6 +3,12 @@ Description
 
 Optimized computations of Higher-Order-Marginal (HOM) of multiple sequence alignments (MSAs) and "r20" comparison scores. The code is parallelized and uses a trie for histogram counting.
 
+This Code is used and described in the publication:
+
+The Generative Capacity of Probabilistic Protein
+Sequence Models.  Francisco McGee , Sandro Hauri , Quentin Novinger , Slobodan Vucetic,
+Ronald M Levy, Vincenzo Carnevale, and Allan Haldane. 2021
+
 Setup
 =====
 
@@ -12,7 +18,7 @@ Compile by running "make", which should produce seqtools.xxx.so and highmarg.xxx
 Requirements
 ===========
 
-When run this use all available CPUs, so will be faster if you run it on a computer with many CPUs. The optimizations also depend "fork" capabilities to spawn processes, which is only available on unix systems (and not osx). The code will still run on osx/windows but slower.
+When run this use all available CPUs, so will be faster if you run it on a computer with many CPUs.
 
 Instructions
 ============
@@ -34,10 +40,21 @@ This should run very quickly, and create a file "top20_my_example.db". This is a
 Next, in "count" mode you can compute r20 scores measuring the similarity in the top 20 marginals of another MSA, as follows:
 
 ```
-$ ../HOM_r20.py count my_example r20_mi modelMSA indepMSA
+$ ../HOM_r20.py count my_example r20_mi modelMSA
 ```
 
-This runs the "count" action, against the database "my_example", and will write the output to the file r20_mi.npy. It computes the r20 scores for the modelMSA and the indepMSA. Alternately, multiple MSAs may be supplied, or only one (eg, just modelMSA). The output file r20_mi.npy is a numpy array of dimension NxRxM where N is the number of sets of positions (eg, npos=2-8 means 6 sets), R is the number of samples (1000 in the database constructed above) and M is the number of input MSAs (2 in this case, modelMSA and indepMSA).
+This runs the "count" action, against the database "my_example", and will write the output to the file r20_mi.npy. It computes the r20 scores for the modelMSA. The output file r20_mi.npy is a numpy array of dimension NxR where N is the number of sets of positions (eg, npos=2-8 means 6 sets), R is the number of samples (1000 in the database constructed above).
+
+Next, you can compute "connected correlations" using the same databases (see publication for details). First, you convert an existing r20 database to create a cc-r20 database. (Each marginal is converted to a connected correlation):
+```
+../HOM_r20.py convert_cc_db mu_example my_example_cc targetMSA --cutoff 6
+```
+It is recommended to skip calculating higher-orders above a cutoff such as 6, as the higher orders are slow to compute and inaccurate. This creates the cc database, my_example_cc.db. Then, from this database you can compute cc-r20 scores:
+```
+$ ../HOM_r20.py count_cc my_example_cc ccr20_mi modelMSA
+```
+This runs the "count_cc" action, against the database "my_example_cc", and will write the output to the file ccr20_mi.npy. It computes the cc-r20 scores for the modelMSA. The output file ccr20_mi.npy has the same dimension as the r20_mi.npy file described above.
+
 
 Typical Usage and Tips
 ======================

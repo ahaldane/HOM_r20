@@ -9,6 +9,14 @@ import seqload
 from scipy.stats import pearsonr, spearmanr
 from highmarg import highmarg, countref
 
+# from python3.9
+def removesuffix(self: str, suffix: str, /) -> str:
+    # suffix='' should not call self[:-0].
+    if suffix and self.endswith(suffix):
+        return self[:-len(suffix)]
+    else:
+        return self[:]
+
 # class to store MSA+weights in shared memory, to share between processes
 # (since MSA is huge)
 class SharedMSA:
@@ -104,6 +112,30 @@ def get_subseq(msa, pos, out=None):
         ret[:,n] = msa[:,p]
     return ret
 
+def read_db(db_name):
+    positionsets = {}
+    with open('{}.db'.format(db_name), "rt") as f:
+        while True:
+            lines = []
+            while lines == [] or lines[-1] not in ['\n', '']:
+                lines.append(f.readline())
+            if lines[-1] == '':
+                break
+
+            pos = [int(p) for p in lines[0].split()]
+
+            slines = (l.split() for l in lines[1:] if not l.isspace())
+            seqs, fs = zip(*((s, float(f)) for s,f in slines))
+            seqs = [[alpha.index(c) for c in s] for s in seqs]
+            seqs = np.array(seqs, dtype='u1')
+            fs = np.array(fs, dtype='f4')
+
+            npos = len(pos)
+            if npos not in positionsets:
+                positionsets[npos] = []
+            positionsets[npos].append((pos, seqs, fs))
+    return positionsets
+
 ###############################################################################
 # functions to generate db
 
@@ -161,7 +193,7 @@ def make_db(args):
     args = parser.parse_args(args)
 
     reps = args.reps
-    name = args.name.strip('.db')
+    name = removesuffix(args.name, '.db')
     topmode = args.topmode
 
     dataseqs = seqload.loadSeqs(args.msa)[0]
@@ -249,8 +281,7 @@ def connected_corr(subseqs, s):
 
     return gs[pos]
 
-def convert_cc_job(dat, shm_info):
-    pos, seqs = dat
+def convert_cc_job(pos, seqs, shm_info):
     shm = SharedMSA(*shm_info)
 
     subseqs = get_subseq(shm.msa, pos)
@@ -267,40 +298,22 @@ def convert_cc_db(args):
     parser.add_argument('--cutoff', type=int, default=20)
     args = parser.parse_args(args)
 
-    out_db_name = args.out_db_name.strip('.db')
-    db_name = args.db_name.strip('.db')
+    out_db_name = removesuffix(args.out_db_name, '.db')
+    db_name = removesuffix(args.db_name, '.db')
 
     msa = seqload.loadSeqs(args.msa)[0]
 
-    positionsets = {}
-    with open('{}.db'.format(db_name), "rt") as f:
-        while True:
-            lines = []
-            while lines == [] or lines[-1] not in ['\n', '']:
-                lines.append(f.readline())
-            if lines[-1] == '':
-                break
+    positionsets = read_db(db_name)
+    positionsets = {n: d for n,d in positionsets.items() 
+                    if n <= args.cutoff}
 
-            pos = [int(p) for p in lines[0].split()]
-            if len(pos) > args.cutoff:
-                continue
-
-            slines = (l.split() for l in lines[1:] if not l.isspace())
-            seqs, fs = zip(*((s, float(f)) for s,f in slines))
-            seqs = [[alpha.index(c) for c in s] for s in seqs]
-            seqs = np.array(seqs, dtype='u1')
-            fs = np.array(fs, dtype='f4')
-
-            npos = len(pos)
-            if npos not in positionsets:
-                positionsets[npos] = []
-            positionsets[npos].append((pos, seqs))
     npos = list(positionsets.keys())
     npos.sort(reverse=True)
 
     shm = SharedMSA(msa, None)
     try:
-        jobs = [(d, shm.info()) for n in npos for d in positionsets[n]]
+        jobs = [(pos, seqs, shm.info()) for n in npos
+                for pos, seqs, fs in positionsets[n]]
         print(f"Starting {os.cpu_count()} workers...")
         with ProcessPoolExecutor(os.cpu_count()) as executor:
             res = list(map_progress(executor, convert_cc_job, jobs))
@@ -309,7 +322,7 @@ def convert_cc_db(args):
         shm.unlink()
 
     with open("{}.db".format(out_db_name), "wt") as f:
-        for ((pos, seqs), _), gs in zip(jobs, res):
+        for (pos, seqs, _), gs in zip(jobs, res):
             out = [" ".join(str(p) for p in pos)]
             seqs = ["".join(alpha[c] for c in si) for si in seqs]
             out += ["{} {}".format(si, fi) for si,fi in zip(seqs, gs)]
@@ -319,9 +332,7 @@ def convert_cc_db(args):
 ###############################################################################
 # Functions to search db and compute r20
 
-def count_job(dat, score, shm_info):
-    pos, ref_seqs, fs = dat
-
+def count_job(pos, ref_seqs, fs, score, shm_info):
     shm = SharedMSA(*shm_info)
     msa, weights = shm.msa, shm.weights
 
@@ -356,7 +367,7 @@ def count_msas(args):
     parser.add_argument('db_name')
     parser.add_argument('out_name')
     parser.add_argument('msa')
-    parser.add_argument('--weights', nargs='*')
+    parser.add_argument('--weights')
     parser.add_argument('--score', default='pearson',
                         choices=['pearson', 'pearsonlog', 'spearman', 'pcttvd'])
     args = parser.parse_args(args)
@@ -364,34 +375,18 @@ def count_msas(args):
     msa = seqload.loadSeqs(args.msa)[0]
     weights = None
     if args.weights:
-        weights = [np.load(w) if w != 'None' else None for m in args.weights]
+        weights = np.load(w).astype('f4')
 
-    positionsets = {}
-    with open('{}.db'.format(args.db_name.rstrip('.db')), "rt") as f:
-        while True:
-            lines = []
-            while lines == [] or lines[-1] not in ['\n', '']:
-                lines.append(f.readline())
-            if lines[-1] == '':
-                break
 
-            pos = [int(p) for p in lines[0].split()]
-            slines = (l.split() for l in lines[1:] if not l.isspace())
-            seqs, fs = zip(*((s, float(f)) for s,f in slines))
-            seqs = [[alpha.index(c) for c in s] for s in seqs]
-            seqs = np.array(seqs, dtype='u1')
-            fs = np.array(fs, dtype='f4')
-
-            npos = len(pos)
-            if npos not in positionsets:
-                positionsets[npos] = []
-            positionsets[npos].append((pos, seqs, fs))
+    db_name = removesuffix(args.db_name, '.db')
+    positionsets = read_db(db_name)
     npos = list(positionsets.keys())
     npos.sort(reverse=True) # process from largest to smallest
 
     shm = SharedMSA(msa, weights)
     try:
-        jobs = ((d, args.score, shm.info()) for n in npos for d in positionsets[n])
+        jobs = ((pos, seqs, fs, args.score, shm.info()) for n in npos
+                 for pos, seqs, fs in positionsets[n])
         print(f"Starting {os.cpu_count()} workers...")
         with ProcessPoolExecutor(os.cpu_count()) as executor:
             res = list(map_progress(executor, count_job, jobs))
@@ -403,11 +398,63 @@ def count_msas(args):
     np.save(args.out_name, res)
 
 ###############################################################################
+# this creates a new db from an existing one by computing the same marginals
+# for another MSA
+
+def recompute_db_job(pos, seqs, shm_info):
+    shm = SharedMSA(*shm_info)
+    msa, weights = shm.msa, shm.weights
+
+    subseqs = np.ascontiguousarray(get_subseq(msa, pos))
+    dfs = countref(seqs, [subseqs], weights)[:,0]
+
+    shm.close()
+
+    Ns = msa.shape[0] if weights is None else np.sum(weights)
+    return dfs/Ns
+
+def recompute_db_msas(args):
+    parser = argparse.ArgumentParser()
+    parser.add_argument('db_name')
+    parser.add_argument('out_name')
+    parser.add_argument('msa')
+    parser.add_argument('--weights')
+    args = parser.parse_args(args)
+
+    msa = seqload.loadSeqs(args.msa)[0]
+    weights = None
+    if args.weights:
+        weights = np.load(w).astype('f4')
+
+    out_name = removesuffix(args.out_name, '.db')
+    db_name = removesuffix(args.db_name, '.db')
+    positionsets = read_db(db_name)
+    npos = list(positionsets.keys())
+    npos.sort(reverse=True) # process from largest to smallest
+
+    shm = SharedMSA(msa, weights)
+    try:
+        jobs = [(pos, seqs, shm.info()) for n in npos
+                 for pos, seqs, fs in positionsets[n]]
+        print(f"Starting {os.cpu_count()} workers...")
+        with ProcessPoolExecutor(os.cpu_count()) as executor:
+            res = list(map_progress(executor, recompute_db_job, jobs))
+    finally:
+        shm.close()
+        shm.unlink()
+
+    with open("{}.db".format(out_name), "wt") as f:
+        for (pos, seqs, _), fs in zip(jobs, res):
+            out = [" ".join(str(p) for p in pos)]
+            seqs = ["".join(alpha[c] for c in si) for si in seqs]
+            out += ["{} {}".format(si, fi) for si,fi in zip(seqs, fs)]
+            out = "\n".join(out) + '\n\n'
+            f.write(out)
+
+###############################################################################
 # Functions to search db and compute r20
 
-def count_cc_job(dat, score, shm_info):
-    pos, seqs, ogs = dat
-
+def count_cc_job(pos, seqs, ogs, score, shm_info):
     shm = SharedMSA(*shm_info)
     msa, weights = shm.msa, shm.weights
 
@@ -437,32 +484,15 @@ def count_cc_msas(args):
 
     msa = seqload.loadSeqs(args.msa)[0]
 
-    positionsets = {}
-    with open('{}.db'.format(args.db_name.rstrip('.db')), "rt") as f:
-        while True:
-            lines = []
-            while lines == [] or lines[-1] not in ['\n', '']:
-                lines.append(f.readline())
-            if lines[-1] == '':
-                break
-
-            pos = [int(p) for p in lines[0].split()]
-            slines = (l.split() for l in lines[1:] if not l.isspace())
-            seqs, gs = zip(*((s, float(f)) for s,f in slines))
-            seqs = [[alpha.index(c) for c in s] for s in seqs]
-            seqs = np.array(seqs, dtype='u1')
-            gs = np.array(gs, dtype='f4')
-
-            npos = len(pos)
-            if npos not in positionsets:
-                positionsets[npos] = []
-            positionsets[npos].append((pos, seqs, gs))
+    db_name = removesuffix(args.db_name, '.db')
+    positionsets = read_db(db_name)
     npos = list(positionsets.keys())
     npos.sort(reverse=True) # process from largest to smallest
 
     shm = SharedMSA(msa, None)
     try:
-        jobs = ((d, args.score, shm.info()) for n in npos for d in positionsets[n])
+        jobs = ((pos, seqs, gs, args.score, shm.info()) for n in npos
+                for pos, seqs, gs in positionsets[n])
         print(f"Starting {os.cpu_count()} workers...")
         with ProcessPoolExecutor(os.cpu_count()) as executor:
             res = list(map_progress(executor, count_cc_job, jobs))
@@ -504,6 +534,7 @@ def main():
     funcs = {'make_db': make_db,
              #'profile_count': profile_count,
              'count': count_msas,
+             'recompute_db': recompute_db_msas,
              'convert_cc_db': convert_cc_db,
              'count_cc': count_cc_msas,
              }
